@@ -6,7 +6,6 @@ all: fmt vet mod
 mod:
 	@go mod tidy -compat=1.20
 	@go mod verify
-	@go mod vendor
 
 .PHONY: fmt
 fmt:
