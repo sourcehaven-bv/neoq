@@ -32,6 +32,7 @@
             packages = with pkgs; [
               automake
               gcc
+              git-chglog
               go_1_23
               gomod2nix.legacyPackages.${system}.gomod2nix
               gotools
@@ -39,6 +40,7 @@
               go-tools
               gopls
               pre-commit
+              svu
             ];
 
             enterShell = ''

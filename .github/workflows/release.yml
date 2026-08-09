@@ -1,0 +1,59 @@
+name: release
+
+on:
+  push:
+    paths-ignore:
+      - README.md
+      - env.sample
+    branches:
+      - main
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Detect version bump
+        id: ver
+        shell: bash -c "nix develop --impure -c bash -- {0}"
+        run: |
+          OLD=$(svu current)
+          NEW=$(svu next)
+          if [ "$OLD" = "$NEW" ]; then
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "bump=true" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        if: steps.ver.outputs.bump == 'true'
+        shell: bash -c "nix develop --impure -c bash -- {0}"
+        run: git-chglog --next-tag="${{ steps.ver.outputs.new }}" "${{ steps.ver.outputs.new }}" > release-notes.md
+
+      - name: Push tag
+        if: steps.ver.outputs.bump == 'true'
+        run: |
+          VERSION="${{ steps.ver.outputs.new }}"
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
+      - name: Create release
+        if: steps.ver.outputs.bump == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.ver.outputs.new }}"
+          curl --fail-with-body -X POST \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/acaloiaro/neoq/releases" \
+            -d "{\"tag_name\":\"${VERSION}\",\"name\":\"${VERSION}\",\"body\":$(jq -Rs . release-notes.md)}"
