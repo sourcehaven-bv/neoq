@@ -1,0 +1,24 @@
+---
+name: golangci-lint
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  golangci:
+    name: lint
+    runs-on: ubuntu-latest
+    container: golang:1.24.0
+    steps:
+      - name: checkout
+        run: |
+          git clone "${{ github.server_url }}/${{ github.repository }}.git" .
+          git checkout "${{ github.sha }}"
+      - name: go mod
+        run: make mod
+      - name: golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh | sh -s -- -b "$(go env GOPATH)/bin"
+          golangci-lint run --new-from-merge-base=origin/main
