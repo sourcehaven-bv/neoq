@@ -37,7 +37,7 @@ jobs:
       - name: Generate changelog
         if: steps.ver.outputs.bump == 'true'
         shell: bash -c "nix develop --impure -c bash -- {0}"
-        run: git-chglog --next-tag="${{ steps.ver.outputs.new }}" "${{ steps.ver.outputs.new }}" > release-notes.md
+        run: git-chglog --tag-filter-pattern '^v[0-9]+\.[0-9]+\.[0-9]+$' --next-tag="${{ steps.ver.outputs.new }}" "${{ steps.ver.outputs.new }}" > release-notes.md
 
       - name: Push tag
         if: steps.ver.outputs.bump == 'true'
