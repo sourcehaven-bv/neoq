@@ -3,11 +3,6 @@
     nixpkgs.url = "github:nixos/nixpkgs/nixpkgs-unstable";
     systems.url = "github:nix-systems/default";
     devenv.url = "github:cachix/devenv/v0.6.3";
-
-    gomod2nix = {
-      url = "github:nix-community/gomod2nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
   outputs = {
@@ -15,7 +10,6 @@
     nixpkgs,
     devenv,
     systems,
-    gomod2nix,
     ...
   } @ inputs: let
     forEachSystem = nixpkgs.lib.genAttrs (import systems);
@@ -32,13 +26,14 @@
             packages = with pkgs; [
               automake
               gcc
+              git-chglog
               go_1_23
-              gomod2nix.legacyPackages.${system}.gomod2nix
               gotools
               golangci-lint
               go-tools
               gopls
               pre-commit
+              svu
             ];
 
             enterShell = ''
@@ -46,14 +41,6 @@
               export TEST_REDIS_URL=localhost:${toString redisPort}
               export REDIS_PASSWORD=
             '';
-
-            pre-commit.hooks.gomod2nix = {
-              enable = true;
-              always_run = true;
-              name = "gomod2nix";
-              description = "Run gomod2nix before commit";
-              entry = "./bin/gomod2nix";
-            };
 
             services = {
               postgres = {

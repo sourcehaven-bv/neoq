@@ -1,0 +1,46 @@
+name: prerelease
+
+on:
+  workflow_dispatch: {}
+
+jobs:
+  prerelease:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Compute prerelease version
+        id: ver
+        shell: bash -c "nix develop --impure -c bash -- {0}"
+        run: |
+          LABEL=$(printf '%s' "${{ github.ref_name }}" | tr -c 'a-zA-Z0-9' '-')
+          VERSION=$(svu next --always --prerelease="${LABEL}.${{ github.run_number }}")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        shell: bash -c "nix develop --impure -c bash -- {0}"
+        run: git-chglog --next-tag="${{ steps.ver.outputs.version }}" "${{ steps.ver.outputs.version }}" > release-notes.md
+
+      - name: Push tag
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
+      - name: Create prerelease
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.ver.outputs.version }}"
+          curl --fail-with-body -X POST \
+            -H "Authorization: token ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/acaloiaro/neoq/releases" \
+            -d "{\"tag_name\":\"${VERSION}\",\"name\":\"${VERSION}\",\"body\":$(jq -Rs . release-notes.md),\"prerelease\":true}"

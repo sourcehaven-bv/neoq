@@ -1,0 +1,63 @@
+name: release
+
+on:
+  push:
+    paths-ignore:
+      - README.md
+      - env.sample
+    branches:
+      - main
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        run: |
+          git clone "${{ github.server_url }}/${{ github.repository }}.git" .
+          git checkout "${{ github.sha }}"
+
+      - uses: https://github.com/cachix/install-nix-action@v31
+        with:
+          nix_path: nixpkgs=channel:nixos-unstable
+
+      - name: Detect version bump
+        id: ver
+        shell: bash -c "rm -rf /homeless-shelter; nix develop --impure -c bash -- {0}"
+        run: |
+          OLD=$(svu current)
+          NEW=$(svu next)
+          if [ "$OLD" = "$NEW" ]; then
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "bump=true" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+
+      - name: Generate changelog
+        if: steps.ver.outputs.bump == 'true'
+        shell: bash -c "rm -rf /homeless-shelter; nix develop --impure -c bash -- {0}"
+        run: git-chglog --next-tag="${{ steps.ver.outputs.new }}" "${{ steps.ver.outputs.new }}" > release-notes.md
+
+      - name: Push tag
+        if: steps.ver.outputs.bump == 'true'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.ver.outputs.new }}"
+          HOST="${{ github.server_url }}"
+          git remote set-url origin "https://oauth2:${TOKEN}@${HOST#https://}/${{ github.repository }}.git"
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
+      - name: Create release
+        if: steps.ver.outputs.bump == 'true'
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${{ steps.ver.outputs.new }}"
+          curl --fail-with-body -X POST \
+            -H "Authorization: token ${TOKEN}" \
+            -H "Content-Type: application/json" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases" \
+            -d "{\"tag_name\":\"${VERSION}\",\"name\":\"${VERSION}\",\"body\":$(jq -Rs . release-notes.md)}"
