@@ -7,9 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"maps"
-	"net/url"
 	"os"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,7 +19,7 @@ import (
 	"github.com/acaloiaro/neoq/jobs"
 	"github.com/acaloiaro/neoq/logging"
 	"github.com/golang-migrate/migrate/v4"
-	_ "github.com/golang-migrate/migrate/v4/database/postgres" // nolint: revive
+	migratepgx "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/iancoleman/strcase"
 	"github.com/jackc/pgerrcode"
@@ -27,6 +27,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
 	"github.com/jsuar/go-cron-descriptor/pkg/crondescriptor"
 	"github.com/robfig/cron"
 )
@@ -35,8 +36,14 @@ import (
 var migrationsFS embed.FS
 
 const (
-	queryParamSSLMode         = "sslmode"
-	queryParamMigrationsTable = "x-migrations-table"
+	// migrationsTable is the default name of the table golang-migrate uses to track applied migrations. Callers may
+	// override it by supplying the x-migrations-table query parameter in their connection string.
+	migrationsTable = "neoq_schema_migrations"
+
+	// queryParamMigrationsTableName is the golang-migrate connection-string parameter that names the migrations table. Like
+	// all golang-migrate URL parameters it is "x-" prefixed and is not a Postgres runtime parameter, so it must be
+	// stripped from the connection config before connecting.
+	queryParamMigrationsTableName = "x-migrations-table"
 
 	JobQuery = `SELECT id,fingerprint,queue,status,deadline,payload,retries,max_retries,run_after,ran_at,created_at,error
 					FROM neoq_jobs
@@ -78,7 +85,6 @@ var (
 	ErrDuplicateJob                  = errors.New("duplicate job")
 	ErrNoTransactionInContext        = errors.New("context does not have a Tx set")
 	ErrExceededConnectionPoolTimeout = errors.New("exceeded timeout acquiring a connection from the pool")
-	ErrUnsupportedURIScheme          = errors.New("only postgres:// and postgresql:// scheme URIs are supported, invalid connection string")
 )
 
 // PgBackend is a Postgres-based Neoq backend
@@ -165,6 +171,8 @@ func Backend(ctx context.Context, opts ...neoq.ConfigOption) (pb neoq.Neoq, err 
 		if err != nil || p.config.ConnectionString == "" {
 			return nil, ErrCnxString
 		}
+
+		stripMigrateParams(poolConfig.ConnConfig)
 
 		// ensure that workers don't consume connections with idle transactions
 		poolConfig.AfterConnect = func(ctx context.Context, conn *pgx.Conn) (err error) {
@@ -288,6 +296,9 @@ func (p *PgBackend) newListenerConn(ctx context.Context) (conn *pgx.Conn, err er
 			delete(pgxCfg.RuntimeParams, param)
 		}
 	}
+
+	stripMigrateParams(pgxCfg)
+
 	conn, err = pgx.ConnectConfig(ctx, pgxCfg)
 	if err != nil {
 		p.logger.Error("unable to acquire listener connection", slog.Any("error", err))
@@ -355,6 +366,27 @@ func txFromContext(ctx context.Context) (t pgx.Tx, err error) {
 	return
 }
 
+// stripMigrateParams strips golang-migrate connection string parameters from our RuntimeParams.
+//
+// golang-migrate URL parameters are "x-" prefixed (e.g. x-migrations-table) and are not valid Postgres connection
+// parameters, so forwarding them to the server yields a "unrecognized configuration parameter" error. It returns
+// the migrations table name to use, honoring a caller-supplied x-migrations-table and otherwise defaulting to
+// migrationsTable.
+func stripMigrateParams(cfg *pgx.ConnConfig) (tableName string) {
+	tableName = migrationsTable
+	for k, v := range cfg.RuntimeParams {
+		if !strings.HasPrefix(k, "x-") {
+			continue
+		}
+		if k == queryParamMigrationsTableName && v != "" {
+			tableName = v
+		}
+		delete(cfg.RuntimeParams, k)
+	}
+
+	return
+}
+
 // initializeDB initializes the tables, types, and indices necessary to operate Neoq
 //
 // This will consume the migration files embedded at build time and will connect to the DB using its own tooling and
@@ -370,18 +402,31 @@ func (p *PgBackend) initializeDB() (err error) {
 		return
 	}
 
-	// `pgx` supports config params that `pq` does not. Since pgx is neoq's primary SQL interface, user often configure
-	// it with pgx-specific config params like `max_conn_count`. However, `go-migrate` uses `pq` under the hood, and
-	// these `pgx` config params cause `pq` to throw an "unknown config parameter" error when they're encountered.
-	// So we must first sanitize connection strings for pq
-	pqConnectionString, err := GetPQConnectionString(p.config.ConnectionString)
+	if p.config.ConnectionString == "" {
+		p.logger.Error("unable to run migrations", slog.Any("error", ErrConnectionStringEmpty))
+		return ErrConnectionStringEmpty
+	}
+
+	poolConfig, err := pgxpool.ParseConfig(p.config.ConnectionString)
 	if err != nil {
 		err = fmt.Errorf("unable to run migrations, error parsing connection string: %w", err)
 		p.logger.Error("unable to run migrations", slog.Any("error", err))
 		return
 	}
 
-	m, err := migrate.NewWithSourceInstance("iofs", migrations, pqConnectionString)
+	// Honor a caller-supplied x-migrations-table and strip golang-migrate's "x-" params so they aren't sent to Postgres
+	// as runtime parameters.
+	migrationsTableName := stripMigrateParams(poolConfig.ConnConfig)
+
+	migrationDB := stdlib.OpenDB(*poolConfig.ConnConfig)
+	driver, err := migratepgx.WithInstance(migrationDB, &migratepgx.Config{MigrationsTable: migrationsTableName})
+	if err != nil {
+		err = fmt.Errorf("unable to run migrations, could not create driver: %w", err)
+		p.logger.Error("unable to run migrations", slog.Any("error", err))
+		return
+	}
+
+	m, err := migrate.NewWithInstance("iofs", migrations, "pgx5", driver)
 	if err != nil {
 		err = fmt.Errorf("unable to run migrations, could not create new source: %w", err)
 		p.logger.Error("unable to run migrations", slog.Any("error", err))
@@ -1100,52 +1145,4 @@ func (p *PgBackend) acquire(ctx context.Context) (conn *pgxpool.Conn, err error)
 		err = ErrExceededConnectionPoolTimeout
 		return
 	}
-}
-
-func GetPQConnectionString(connectionString string) (string, error) {
-	pgxCfg, err := pgx.ParseConfig(connectionString)
-	if err != nil {
-		return "", fmt.Errorf("unable to parse connection string %s: %w", connectionString, err)
-	}
-
-	dbURI, err := url.Parse(pgxCfg.ConnString())
-	if err != nil {
-		return "", fmt.Errorf("unable to parse connection string %s: %w", connectionString, err)
-	}
-
-	if dbURI.String() == "" {
-		return "", ErrConnectionStringEmpty
-	}
-
-	scheme := dbURI.Scheme
-	if scheme == "" {
-		// This is probably a pq-style string, return it as-is
-		return connectionString, nil
-	}
-
-	if scheme != "postgres" && scheme != "postgresql" {
-		// This isn't a postgresql URI-style string (postgres://hostname/db)
-		return "", ErrUnsupportedURIScheme
-	}
-
-	sslMode := "verify-ca"
-	if pgxCfg.TLSConfig == nil {
-		sslMode = "disable"
-	} else if pgxCfg.TLSConfig.InsecureSkipVerify {
-		sslMode = "require"
-	}
-
-	// Prefer original sslmode if it was set
-	originalSSLMode := dbURI.Query().Get(queryParamSSLMode)
-	if originalSSLMode != "" {
-		sslMode = originalSSLMode
-	}
-
-	// Clear out original query, use only query params that are pq compatible
-	query := url.Values{}
-	query.Set(queryParamSSLMode, sslMode)
-	query.Set(queryParamMigrationsTable, "neoq_schema_migrations")
-	dbURI.RawQuery = query.Encode()
-
-	return dbURI.String(), nil
 }
