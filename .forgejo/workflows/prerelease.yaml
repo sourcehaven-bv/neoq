@@ -33,8 +33,8 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${{ steps.ver.outputs.version }}"
-          HOST="${{ github.server_url }}"
-          git remote set-url origin "https://oauth2:${TOKEN}@${HOST#https://}/${{ github.repository }}.git"
+          HOST="https://code.adriano.fyi"
+          git remote set-url origin "https://oauth2:${TOKEN}@${HOST#*://}/${{ github.repository }}.git"
           git tag "$VERSION"
           git push origin "$VERSION"
 
@@ -46,5 +46,5 @@ jobs:
           curl --fail-with-body -X POST \
             -H "Authorization: token ${TOKEN}" \
             -H "Content-Type: application/json" \
-            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/releases" \
+            "https://code.adriano.fyi/api/v1/repos/${{ github.repository }}/releases" \
             -d "{\"tag_name\":\"${VERSION}\",\"name\":\"${VERSION}\",\"body\":$(jq -Rs . release-notes.md),\"prerelease\":true}"
