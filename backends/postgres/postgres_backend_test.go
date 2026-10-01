@@ -1095,3 +1095,82 @@ func TestProcessPendingJobs(t *testing.T) {
 		t.Errorf("job should have resulted in a status of 'processed', but did not")
 	}
 }
+
+// TestJobTimeoutWaitsForHandlerBeforeCommit tests that when a job exceeds its JobTimeout, the handler's context is
+// canceled and the job's transaction is not committed until the handler has stopped. A handler that is still running
+// may be using the job's transaction, so the backend must not commit it from under the handler.
+func TestJobTimeoutWaitsForHandlerBeforeCommit(t *testing.T) {
+	connString, conn := prepareAndCleanupDB(t)
+	const queue = "testing"
+	maxRetries := 5
+
+	ctx := context.Background()
+	nq, err := neoq.New(ctx,
+		neoq.WithBackend(postgres.Backend),
+		postgres.WithConnectionString(connString),
+		neoq.WithLogLevel(logging.LogLevelError))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nq.Shutdown(ctx)
+
+	statusDuringCleanup := make(chan string, 1)
+	h := handler.New(queue, func(ctx context.Context) error {
+		<-ctx.Done()
+
+		// simulate cleanup after cancellation, then check that the job's status has not been committed yet
+		time.Sleep(200 * time.Millisecond)
+		var status string
+		job, err := jobs.FromContext(ctx)
+		if err == nil {
+			err = conn.QueryRow(context.WithoutCancel(ctx), "SELECT status FROM neoq_jobs WHERE id = $1", job.ID).Scan(&status)
+		}
+		if err != nil {
+			status = err.Error()
+		}
+
+		// only the first run is checked; retries must not block
+		select {
+		case statusDuringCleanup <- status:
+		default:
+		}
+
+		return ctx.Err()
+	}, handler.JobTimeout(100*time.Millisecond))
+
+	err = nq.Start(ctx, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	jid, err := nq.Enqueue(ctx, &jobs.Job{
+		Queue:      queue,
+		Payload:    map[string]interface{}{"message": "hello world"},
+		MaxRetries: &maxRetries,
+	})
+	if err != nil || jid == jobs.DuplicateJobID {
+		t.Fatal(err)
+	}
+
+	select {
+	case status := <-statusDuringCleanup:
+		if status != internal.JobStatusNew {
+			t.Fatalf("job status was committed as %q while the handler was still running", status)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler context was not canceled after JobTimeout")
+	}
+
+	var status string
+	deadline := time.Now().Add(5 * time.Second)
+	for status != internal.JobStatusFailed {
+		if time.Now().After(deadline) {
+			t.Fatalf("job status is %q, want %q", status, internal.JobStatusFailed)
+		}
+		time.Sleep(50 * time.Millisecond)
+		err = conn.QueryRow(ctx, "SELECT status FROM neoq_jobs WHERE id = $1", jid).Scan(&status)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}

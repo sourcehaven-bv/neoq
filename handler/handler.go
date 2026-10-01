@@ -14,6 +14,9 @@ import (
 const (
 	DefaultHandlerTimeout = 30 * time.Second
 	DefaultConcurrency    = 50 // goroutines available to do work
+
+	// cancelGracePeriod is how long Exec waits for a handler to return after its context is canceled
+	cancelGracePeriod = time.Second
 )
 
 var (
@@ -56,7 +59,10 @@ func (h *Handler) WithOptions(opts ...Option) {
 
 // JobTimeout configures handlers with a time deadline for every executed job
 // The timeout is the amount of time that can be spent executing the handler's Func
-// when a timeout is exceeded, the job fails and enters its retry phase
+// when a timeout is exceeded, the handler's context is canceled, and the job fails and enters its retry phase
+//
+// Handlers must honor their context's cancellation for the timeout to stop them; handlers that ignore it keep running
+// after the job has failed.
 func JobTimeout(d time.Duration) Option {
 	return func(h *Handler) {
 		h.JobTimeout = d
@@ -141,34 +147,36 @@ func errorFromPanic(x any) (err error) {
 }
 
 // Exec executes handler functions with a concrete timeout
+//
+// The handler's context is canceled when the timeout is exceeded. Exec then waits up to [cancelGracePeriod] for the
+// handler to return, so that a handler which honors its context has stopped using resources from it (such as a
+// database transaction) before Exec returns.
 func Exec(ctx context.Context, handler Handler) (err error) {
 	timeoutCtx, cancel := context.WithTimeout(ctx, handler.JobTimeout)
 	defer cancel()
 
-	errCh := make(chan error, 1)
-	done := make(chan bool)
+	// result is buffered so the handler goroutine can always deliver its result and exit, even after Exec has returned
+	result := make(chan error, 1)
 
-	go func(ctx context.Context) {
+	go func() {
 		defer func() {
 			if x := recover(); x != nil {
-				err = errorFromPanic(x)
-				errCh <- err
+				panicErr := errorFromPanic(x)
 				if handler.RecoverCallback != nil {
-					err = handler.RecoverCallback(ctx, err)
-					if err != nil {
-						slog.Error("handler recovery callback also failed while recovering from panic", slog.Any("error", err))
+					cbErr := handler.RecoverCallback(ctx, panicErr)
+					if cbErr != nil {
+						slog.Error("handler recovery callback also failed while recovering from panic", slog.Any("error", cbErr))
 					}
 				}
+				result <- panicErr
 			}
-			done <- true
 		}()
 
-		errCh <- handler.Handle(ctx)
-	}(ctx)
+		result <- handler.Handle(timeoutCtx)
+	}()
 
 	select {
-	case <-done:
-		err = <-errCh
+	case err = <-result:
 		if err != nil {
 			err = fmt.Errorf("job failed to process: %w", err)
 		}
@@ -181,6 +189,13 @@ func Exec(ctx context.Context, handler Handler) (err error) {
 			err = ctxErr
 		} else {
 			err = fmt.Errorf("job failed to process: %w", ctxErr)
+		}
+
+		grace := time.NewTimer(cancelGracePeriod)
+		defer grace.Stop()
+		select {
+		case <-result:
+		case <-grace.C:
 		}
 	}
 
