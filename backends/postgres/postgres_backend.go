@@ -78,8 +78,7 @@ var (
 	DefaultConnectionTimeout         = 30 * time.Second
 	txCtxVarKey                      contextKey
 	reconnectWaitTime                = 5 * time.Second
-	shutdownJobID                    = "-1" // job ID announced when triggering a shutdown
-	shutdownAnnouncementAllowance    = 100  // ms
+	shutdownJobID                    = "-1" // job ID older versions announce on shutdown; ignored
 	ErrCnxString                     = errors.New("invalid connecton string: see documentation for valid connection strings")
 	ErrConnectionStringEmpty         = errors.New("connection string cannot be empty")
 	ErrDuplicateJob                  = errors.New("duplicate job")
@@ -603,13 +602,12 @@ func (p *PgBackend) Logger() (l logging.Logger) {
 // Shutdown shuts this backend down
 func (p *PgBackend) Shutdown(ctx context.Context) {
 	p.logger.Debug("starting shutdown")
-	for queue := range p.handlers {
-		p.announceJob(ctx, queue, shutdownJobID)
-	}
 
-	// wait for the announcement to process
-	time.Sleep(time.Duration(shutdownAnnouncementAllowance) * time.Millisecond)
-
+	// Shutdown used to pg_notify shutdownJobID on every queue to stop the
+	// listener. NOTIFY reaches every session listening on the channel, so it
+	// also stopped the listeners of every other process sharing the database,
+	// which then never processed a job again. Cancelling the contexts below
+	// interrupts this backend's WaitForNotification on its own.
 	for _, f := range p.cancelFuncs {
 		f()
 	}
@@ -1069,9 +1067,11 @@ func (p *PgBackend) listen(ctx context.Context) (c chan *pgconn.Notification, er
 				slog.Any("err", waitErr),
 			)
 
-			// check if Shutdown() has been called
+			// Older versions broadcast shutdownJobID when THEY shut down. It
+			// says nothing about this backend, so ignore it rather than stop
+			// listening.
 			if notification.Payload == shutdownJobID {
-				return
+				continue
 			}
 
 			c <- notification

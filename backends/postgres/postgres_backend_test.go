@@ -1174,3 +1174,50 @@ func TestJobTimeoutWaitsForHandlerBeforeCommit(t *testing.T) {
 		}
 	}
 }
+
+// TestShutdownDoesNotStopOtherBackends pins that one backend's Shutdown leaves
+// other backends on the same database processing jobs. Shutdown used to
+// pg_notify a sentinel job ID on its queues, which every listening session
+// received, so a short-lived process sharing the database (a CLI command)
+// silently stopped a long-running server's workers.
+func TestShutdownDoesNotStopOtherBackends(t *testing.T) {
+	connString, _ := prepareAndCleanupDB(t)
+	const queue = "testing"
+	ctx := context.Background()
+
+	server, err := neoq.New(ctx, neoq.WithBackend(postgres.Backend), postgres.WithConnectionString(connString))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer server.Shutdown(ctx)
+
+	done := make(chan bool, 2)
+	err = server.Start(ctx, handler.New(queue, func(_ context.Context) error {
+		done <- true
+		return nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	other, err := neoq.New(ctx, neoq.WithBackend(postgres.Backend), postgres.WithConnectionString(connString))
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = other.Start(ctx, handler.New(queue, func(_ context.Context) error { return nil }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	other.Shutdown(ctx)
+
+	_, err = server.Enqueue(ctx, &jobs.Job{Queue: queue, Payload: map[string]any{"after": "shutdown"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("job enqueued after another backend's shutdown was never processed")
+	}
+}
