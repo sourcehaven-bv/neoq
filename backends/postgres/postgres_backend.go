@@ -230,6 +230,12 @@ func (p *PgBackend) listenerManager(ctx context.Context) {
 			}
 
 			p.listenerConnMu.Lock()
+			if ctx.Err() != nil {
+				// Shutdown already ran; don't leave a connection it can't close.
+				_ = lc.Close(context.Background())
+				p.listenerConnMu.Unlock()
+				return
+			}
 			p.listenerConn = lc
 			p.mu.Lock()
 			for queue := range p.handlers {
@@ -617,6 +623,20 @@ func (p *PgBackend) Shutdown(ctx context.Context) {
 		f()
 	}
 
+	// The listener connection lives outside the pool, so pool.Close leaves it
+	// open. An open session that LISTENs but is never read stops Postgres from
+	// trimming its notification queue; once that fills, every pg_notify on the
+	// database fails. Taking the mutex waits for WaitForNotification to return
+	// on the canceled context.
+	p.listenerConnMu.Lock()
+	if p.listenerConn != nil {
+		closeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = p.listenerConn.Close(closeCtx)
+		cancel()
+		p.listenerConn = nil
+	}
+	p.listenerConnMu.Unlock()
+
 	p.pool.Close()
 	p.cron.Stop()
 
@@ -910,7 +930,11 @@ func (p *PgBackend) processPendingJobs(ctx context.Context) {
 			}
 			if err != nil {
 				p.Logger().Error("[pending_jobs] unable to get database connection", slog.Any("error", err))
-				<-ticker.C
+				select {
+				case <-ticker.C:
+				case <-ctx.Done():
+					return
+				}
 				continue
 			}
 
@@ -1065,7 +1089,11 @@ func (p *PgBackend) listen(ctx context.Context) (c chan *pgconn.Notification, er
 				p.listenerConnMu.Unlock()
 				if lc == nil || lc.IsClosed() {
 					p.logger.Error("worker database connection closed and will attempt to reconnect periodically. jobs are not being processed")
-					p.listenConnDown <- true
+					select {
+					case p.listenConnDown <- true:
+					case <-ctx.Done():
+						return
+					}
 					time.Sleep(reconnectWaitTime)
 				}
 
@@ -1085,7 +1113,11 @@ func (p *PgBackend) listen(ctx context.Context) (c chan *pgconn.Notification, er
 				continue
 			}
 
-			c <- notification
+			select {
+			case c <- notification:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}(ctx)
 
@@ -1124,9 +1156,7 @@ func (p *PgBackend) getPendingJobs(ctx context.Context, conn *pgxpool.Conn) (pen
 	return
 }
 
-// acquire acquires connections from the connection pool with a timeout
-//
-// the purpose of this function is to skirt pgxpool's default blocking behavior with connection acquisition preemption
+// acquire acquires a connection from the pool, giving up after PGConnectionTimeout
 func (p *PgBackend) acquire(ctx context.Context) (conn *pgxpool.Conn, err error) {
 	ctx, cancelFunc := context.WithDeadline(ctx, time.Now().Add(p.config.PGConnectionTimeout))
 	defer cancelFunc()
@@ -1141,7 +1171,7 @@ func (p *PgBackend) acquire(ctx context.Context) (conn *pgxpool.Conn, err error)
 	if err != nil {
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			p.Logger().Error("exceeded timeout acquiring a connection from the pool", slog.Any("timeout", p.config.PGConnectionTimeout))
-			return nil, ErrExceededConnectionPoolTimeout
+			return nil, fmt.Errorf("%w: %w", ErrExceededConnectionPoolTimeout, err)
 		}
 		return nil, err
 	}

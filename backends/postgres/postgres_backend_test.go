@@ -1215,9 +1215,93 @@ func TestShutdownDoesNotStopOtherBackends(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The wait must stay below the pending-job poll interval (60s by default):
+	// the poll would otherwise process the job even with a dead listener.
 	select {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("job enqueued after another backend's shutdown was never processed")
+	}
+}
+
+// TestListenerIgnoresShutdownBroadcast pins that a shutdownJobID notification,
+// which older versions broadcast on Shutdown, does not stop the listener.
+func TestListenerIgnoresShutdownBroadcast(t *testing.T) {
+	connString, conn := prepareAndCleanupDB(t)
+	const queue = "testing_broadcast"
+	ctx := context.Background()
+
+	nq, err := neoq.New(ctx, neoq.WithBackend(postgres.Backend), postgres.WithConnectionString(connString))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer nq.Shutdown(ctx)
+
+	done := make(chan bool, 1)
+	err = nq.Start(ctx, handler.New(queue, func(_ context.Context) error {
+		done <- true
+		return nil
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err = conn.Exec(ctx, "SELECT pg_notify($1, '-1')", queue); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = nq.Enqueue(ctx, &jobs.Job{Queue: queue, Payload: map[string]any{"after": "broadcast"}}); err != nil {
+		t.Fatal(err)
+	}
+
+	// Below the pending-job poll interval, so only the listener can deliver it.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("job enqueued after a shutdown broadcast was never processed")
+	}
+}
+
+// TestShutdownClosesListenerConnection pins that Shutdown closes the LISTEN
+// session. An open, unread listener stops Postgres from trimming its
+// notification queue, which eventually makes every pg_notify fail.
+func TestShutdownClosesListenerConnection(t *testing.T) {
+	connString, conn := prepareAndCleanupDB(t)
+	const queue = "testing_listener_close"
+	ctx := context.Background()
+
+	listeners := func() int {
+		var n int
+		err := conn.QueryRow(ctx,
+			"SELECT count(*) FROM pg_stat_activity WHERE query = $1", fmt.Sprintf(`LISTEN %q`, queue)).Scan(&n)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	nq, err := neoq.New(ctx, neoq.WithBackend(postgres.Backend), postgres.WithConnectionString(connString))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = nq.Start(ctx, handler.New(queue, func(_ context.Context) error { return nil })); err != nil {
+		t.Fatal(err)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for listeners() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("listener session never appeared")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	nq.Shutdown(ctx)
+
+	deadline = time.Now().Add(5 * time.Second)
+	for listeners() != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("listener session still open after Shutdown")
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }
