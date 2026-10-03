@@ -222,6 +222,9 @@ func (p *PgBackend) listenerManager(ctx context.Context) {
 		case <-p.listenConnDown:
 			lc, err := p.newListenerConn(ctx)
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				p.logger.Error("listener connection is down, and unable to reconnect", slog.Any("error", err))
 				continue
 			}
@@ -300,7 +303,9 @@ func (p *PgBackend) newListenerConn(ctx context.Context) (conn *pgx.Conn, err er
 
 	conn, err = pgx.ConnectConfig(ctx, pgxCfg)
 	if err != nil {
-		p.logger.Error("unable to acquire listener connection", slog.Any("error", err))
+		if ctx.Err() == nil {
+			p.logger.Error("unable to acquire listener connection", slog.Any("error", err))
+		}
 		return
 	}
 	_, err = conn.Exec(ctx, "SET idle_in_transaction_session_timeout = 0")
@@ -606,7 +611,7 @@ func (p *PgBackend) Shutdown(ctx context.Context) {
 	// Shutdown used to pg_notify shutdownJobID on every queue to stop the
 	// listener. NOTIFY reaches every session listening on the channel, so it
 	// also stopped the listeners of every other process sharing the database,
-	// which then never processed a job again. Cancelling the contexts below
+	// which then never processed a job again. Canceling the contexts below
 	// interrupts this backend's WaitForNotification on its own.
 	for _, f := range p.cancelFuncs {
 		f()
@@ -897,6 +902,12 @@ func (p *PgBackend) processPendingJobs(ctx context.Context) {
 		// check for pending jobs on an interval until the context is canceled
 		for {
 			conn, err = p.acquire(ctx)
+			if ctx.Err() != nil {
+				if conn != nil {
+					conn.Release()
+				}
+				return
+			}
 			if err != nil {
 				p.Logger().Error("[pending_jobs] unable to get database connection", slog.Any("error", err))
 				<-ticker.C
@@ -1122,27 +1133,17 @@ func (p *PgBackend) acquire(ctx context.Context) (conn *pgxpool.Conn, err error)
 
 	p.Logger().Debug("acquiring connection with timeout", slog.Any("timeout", p.config.PGConnectionTimeout))
 
-	connCh := make(chan *pgxpool.Conn)
-	errCh := make(chan error)
-
-	go func() {
-		c, err := p.pool.Acquire(ctx)
-		if err != nil {
-			errCh <- err
+	// Acquire honors ctx itself. This used to race it in a goroutine against
+	// unbuffered channels: after an error the goroutine also sent on connCh
+	// and blocked forever, and a connection acquired just as the deadline
+	// passed was never released.
+	conn, err = p.pool.Acquire(ctx)
+	if err != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			p.Logger().Error("exceeded timeout acquiring a connection from the pool", slog.Any("timeout", p.config.PGConnectionTimeout))
+			return nil, ErrExceededConnectionPoolTimeout
 		}
-
-		connCh <- c
-	}()
-
-	select {
-	case conn = <-connCh:
-		return conn, nil
-	case err := <-errCh:
 		return nil, err
-	case <-ctx.Done():
-		p.Logger().Error("exceeded timeout acquiring a connection from the pool", slog.Any("timeout", p.config.PGConnectionTimeout))
-		cancelFunc()
-		err = ErrExceededConnectionPoolTimeout
-		return
 	}
+	return conn, nil
 }
