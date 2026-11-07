@@ -508,3 +508,21 @@ func TestHandlerRecoveryCallback(t *testing.T) {
 		t.Error(err)
 	}
 }
+
+// TestShutdownReleasesGoroutines checks that Shutdown stops every goroutine
+// Backend started, including the periodic task manager's scheduler.
+func TestShutdownReleasesGoroutines(t *testing.T) {
+	connString := os.Getenv("TEST_REDIS_URL")
+	if connString == "" {
+		t.Skip("Skipping: TEST_REDIS_URL not set")
+	}
+
+	ctx := context.Background()
+	testutils.AssertNoGoroutineLeak(t, 20, func() {
+		nq, err := neoq.New(ctx, neoq.WithBackend(Backend), WithAddr(connString))
+		if err != nil {
+			t.Fatal(err)
+		}
+		nq.Shutdown(ctx)
+	})
+}

@@ -1305,3 +1305,17 @@ func TestShutdownClosesListenerConnection(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 }
+
+// TestShutdownReleasesGoroutines checks that Shutdown stops every goroutine
+// Backend started, including the cron scheduler's.
+func TestShutdownReleasesGoroutines(t *testing.T) {
+	connString, _ := prepareAndCleanupDB(t)
+	ctx := context.Background()
+	testutils.AssertNoGoroutineLeak(t, 20, func() {
+		nq, err := neoq.New(ctx, neoq.WithBackend(postgres.Backend), postgres.WithConnectionString(connString))
+		if err != nil {
+			t.Fatal(err)
+		}
+		nq.Shutdown(ctx)
+	})
+}

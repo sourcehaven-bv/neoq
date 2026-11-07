@@ -43,6 +43,7 @@ type RedisBackend struct {
 	mu           *sync.Mutex // mutext to protect mutating backend state
 	taskProvider *memoryTaskConfigProvider
 	mgr          *asynq.PeriodicTaskManager
+	shutdownOnce *sync.Once
 }
 
 type memoryTaskConfigProvider struct {
@@ -80,6 +81,7 @@ func Backend(_ context.Context, opts ...neoq.ConfigOption) (backend neoq.Neoq, e
 		config:       neoq.NewConfig(),
 		mu:           &sync.Mutex{},
 		taskProvider: newMemoryTaskConfigProvider(),
+		shutdownOnce: &sync.Once{},
 	}
 
 	for _, opt := range opts {
@@ -130,17 +132,17 @@ func Backend(_ context.Context, opts ...neoq.ConfigOption) (backend neoq.Neoq, e
 		log.Fatal(err)
 	}
 
-	go func() {
-		if err := b.mgr.Run(); err != nil {
-			log.Fatal(err)
-		}
-	}()
+	// Start, not Run: Run keeps a goroutine waiting for OS signals until the
+	// process exits, so every backend would leak it, and the periodic task
+	// manager's scheduler would only stop on a signal. Shutdown stops both.
+	if err = b.mgr.Start(); err != nil {
+		return nil, fmt.Errorf("failed to start periodic task manager: %w", err)
+	}
 
-	go func() {
-		if err := b.server.Run(b.mux); err != nil {
-			log.Fatal(err)
-		}
-	}()
+	if err = b.server.Start(b.mux); err != nil {
+		b.mgr.Shutdown()
+		return nil, fmt.Errorf("failed to start server: %w", err)
+	}
 
 	backend = b
 
@@ -346,6 +348,13 @@ func (b *RedisBackend) SetLogger(logger logging.Logger) {
 
 // Shutdown halts the worker
 func (b *RedisBackend) Shutdown(_ context.Context) {
-	b.client.Close()
-	b.server.Shutdown()
+	// PeriodicTaskManager.Shutdown panics when called twice.
+	b.shutdownOnce.Do(func() {
+		// Stop the scheduler first, so it does not enqueue periodic tasks for
+		// a server that is shutting down.
+		b.mgr.Shutdown()
+		b.server.Shutdown()
+		b.client.Close()
+		b.inspector.Close()
+	})
 }
