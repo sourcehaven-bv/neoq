@@ -1,0 +1,12 @@
+name: No Session Trailer
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+
+permissions:
+  contents: read
+
+jobs:
+  no-session-trailer:
+    uses: sourcehaven-bv/.github/.github/workflows/no-session-trailer.yml@main
