@@ -427,3 +427,16 @@ result_loop:
 		t.Error(err)
 	}
 }
+
+// TestShutdownReleasesGoroutines checks that Shutdown stops every goroutine
+// Backend started, including the cron scheduler's.
+func TestShutdownReleasesGoroutines(t *testing.T) {
+	ctx := context.Background()
+	testutils.AssertNoGoroutineLeak(t, 20, func() {
+		nq, err := neoq.New(ctx, neoq.WithBackend(memory.Backend))
+		if err != nil {
+			t.Fatal(err)
+		}
+		nq.Shutdown(ctx)
+	})
+}

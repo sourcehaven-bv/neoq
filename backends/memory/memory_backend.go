@@ -202,6 +202,10 @@ func (m *MemBackend) Shutdown(_ context.Context) {
 		f()
 	}
 
+	// Backend starts the cron scheduler's goroutine, so Shutdown must stop
+	// it or every backend leaks one. Stop returns once the goroutine exits.
+	m.cron.Stop()
+
 	m.cancelFuncs = nil
 }
 
